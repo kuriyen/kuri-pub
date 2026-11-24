@@ -5,4 +5,5 @@ members = ["crates/kuri-pub"]
 [workspace.package]
 edition = "2024"
 authors = ["bayanasar"]
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/kuriyen/kuri-pub"
