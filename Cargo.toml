@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/kuri-pub"]
+
+[workspace.package]
+edition = "2024"
+authors = ["bayanasar"]
+repository = "https://github.com/kuriyen/kuri-pub"
