@@ -38,6 +38,9 @@ impl Default for Settings {
     }
 }
 
+/// How many missing blobs a `missing_blobs` fault names; it counts the rest.
+pub const MISSING_SHOWN: usize = 5;
+
 /// The chunk a `get` reads and sends at a time, so its memory does not
 /// depend on the blob's size.
 pub const GET_CHUNK: usize = 64 * 1024;
@@ -234,9 +237,22 @@ impl Depot {
             }
         }
         if !missing.is_empty() {
+            // For people, and bounded: a manifest can name thousands of files.
+            let shown = missing.len().min(MISSING_SHOWN);
+            let more = missing.len() - shown;
             return Err(Fault::new(
                 Code::MissingBlobs,
-                format!("{} not stored: {}", missing.len(), missing.join(", ")),
+                format!(
+                    "{} of {} files not stored: {}{}",
+                    missing.len(),
+                    manifest.files().len(),
+                    missing[..shown].join(", "),
+                    if more > 0 {
+                        format!(", and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ),
             ));
         }
         let digest = manifest.digest().clone();
@@ -431,22 +447,17 @@ impl Put {
     async fn receive(&self, io: &mut Duplex) -> Result<(), Fault> {
         let store = &self.depot.store;
         let (tmp, file) = store.temporary().map_err(storage)?;
-        let outcome = self.write(io, file).await;
-        let outcome = match outcome {
-            Ok(file) => {
-                let file = file.into_std().await;
-                let (depot, digest, tmp2) = (self.depot.clone(), self.digest.clone(), tmp.clone());
-                tokio::task::spawn_blocking(move || depot.store.commit(&tmp2, file, &digest))
-                    .await
-                    .map_err(|e| Fault::new(Code::Storage, e.to_string()))
-                    .and_then(|r| r.map_err(storage))
-            }
-            Err(fault) => Err(fault),
-        };
-        if outcome.is_err() {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
-        outcome
+        // Removes the file however this ends short of a commit: a fault, or
+        // the stream's future dropped mid-upload when its connection went.
+        let mut guard = TmpGuard(Some(tmp.clone()));
+        let file = self.write(io, file).await?.into_std().await;
+        let (depot, digest) = (self.depot.clone(), self.digest.clone());
+        tokio::task::spawn_blocking(move || depot.store.commit(&tmp, file, &digest))
+            .await
+            .map_err(|e| Fault::new(Code::Storage, e.to_string()))?
+            .map_err(storage)?;
+        guard.0 = None;
+        Ok(())
     }
 
     async fn write(&self, io: &mut Duplex, file: File) -> Result<tokio::fs::File, Fault> {
@@ -488,6 +499,17 @@ impl Put {
         }
         file.flush().await.map_err(storage)?;
         Ok(file)
+    }
+}
+
+/// Deletes an upload's temporary file when dropped, unless it was committed.
+struct TmpGuard(Option<std::path::PathBuf>);
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -557,14 +579,14 @@ impl Service for DepotService {
 fn parse<T: DeserializeOwned>(args: Value, otherwise: Code) -> Result<T, Fault> {
     args.deserialized().map_err(|e| {
         let message = e.to_string();
+        // The fault a checked type raised is the first code in the text; a
+        // later one can only be part of its detail, such as a digest
+        // algorithm spelt like a code.
         kuri_pub::fault::CODES
             .iter()
-            .find_map(|code| {
-                let prefix = format!("{}: ", code.as_str());
-                message
-                    .find(&prefix)
-                    .map(|at| Fault::parse(message[at..].trim_end_matches(['"', ')'])))
-            })
+            .filter_map(|code| message.find(&format!("{}: ", code.as_str())))
+            .min()
+            .map(|at| Fault::parse(message[at..].trim_end_matches(['"', ')'])))
             .unwrap_or_else(|| Fault::new(otherwise, message))
     })
 }

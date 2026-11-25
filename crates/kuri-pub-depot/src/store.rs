@@ -9,7 +9,12 @@
 //! written to a file in `tmp/`, synced, renamed into place, and the directory
 //! it landed in is synced. A crash leaves at most a file in `tmp/`, which the
 //! next start removes, never a partial blob under a real name. `tmp/` is inside
-//! the store so the rename never crosses a filesystem.
+//! the store so the rename never crosses a filesystem. A blob is made
+//! read-only before it is renamed into place.
+//!
+//! One depot at a time: opening takes an exclusive lock on `<store>/lock`
+//! for as long as the store is open. A second depot on the same directory
+//! would empty the first one's `tmp/` and append to the same index log.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -23,6 +28,8 @@ use kuri_pub::Digest;
 pub struct Store {
     root: PathBuf,
     next_tmp: AtomicU64,
+    /// Held while the store is open; the lock goes with it.
+    _lock: File,
 }
 
 impl Store {
@@ -30,6 +37,22 @@ impl Store {
     /// an earlier run left in `tmp/`.
     pub fn open(root: &Path) -> io::Result<Store> {
         fs::create_dir_all(root.join("blobs"))?;
+        let lock = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("{} is in use by another depot", root.display()),
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+        // Only now, holding the lock: nobody else is writing into tmp/.
         let tmp = root.join("tmp");
         if tmp.exists() {
             fs::remove_dir_all(&tmp)?;
@@ -39,6 +62,7 @@ impl Store {
         Ok(Store {
             root: root.to_owned(),
             next_tmp: AtomicU64::new(0),
+            _lock: lock,
         })
     }
 
@@ -76,6 +100,9 @@ impl Store {
     /// it into place, and syncs the directory it landed in. The caller has
     /// checked that its content hashes to `digest`.
     pub fn commit(&self, tmp: &Path, file: File, digest: &Digest) -> io::Result<()> {
+        let mut read_only = file.metadata()?.permissions();
+        read_only.set_readonly(true);
+        file.set_permissions(read_only)?;
         file.sync_all()?;
         drop(file);
         let dest = self.path(digest);
@@ -135,6 +162,33 @@ mod tests {
             dir.path().join("blobs/sha256").join(&hex[..2]).join(hex)
         );
         assert_eq!(store.read(&d).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn a_blob_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let d = Digest::sha256(b"x");
+        store.put_bytes(&d, b"x").unwrap();
+        assert!(
+            fs::metadata(store.path(&d))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn one_depot_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Store::open(dir.path()).unwrap();
+        let (path, _file) = first.temporary().unwrap();
+        let e = Store::open(dir.path()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        // The second open gave up before touching the first one's uploads.
+        assert!(path.exists());
+        drop(first);
+        Store::open(dir.path()).unwrap();
     }
 
     #[test]

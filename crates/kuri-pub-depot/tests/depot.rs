@@ -228,6 +228,8 @@ both!(
     bad_names_are_refused,
     has_answers_in_order_and_is_capped,
     manifest_refusals,
+    a_fault_keeps_the_first_code_in_its_text,
+    missing_blobs_names_a_few_and_counts_the_rest,
 );
 
 async fn publish_manifest_get_round_trip(mode: Mode) {
@@ -729,6 +731,141 @@ async fn manifest_refusals(mode: Mode) {
             .unwrap_err();
         assert_eq!(f.code, code);
     }
+}
+
+async fn a_fault_keeps_the_first_code_in_its_text(mode: Mode) {
+    let h = harness(mode, Settings::default()).await;
+    // An algorithm spelt like a code: the fault is still `unsupported_alg`,
+    // with that spelling only in its detail.
+    let odd = map(&[(
+        "digests",
+        Value::Array(vec![digest_wire("bad_name: x", &"0".repeat(64))]),
+    )]);
+    let f = h.raw::<Vec<bool>>(methods::HAS, odd).await.unwrap_err();
+    assert_eq!(f.code, Code::UnsupportedAlg, "{}", f.detail);
+}
+
+async fn missing_blobs_names_a_few_and_counts_the_rest(mode: Mode) {
+    let h = harness(mode, Settings::default()).await;
+    let contents: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i]).collect();
+    let files: Vec<(String, &[u8])> = contents
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (format!("f{i}"), c.as_slice()))
+        .collect();
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    let f = h.publish(&manifest("1", &files)).await.unwrap_err();
+    assert_eq!(f.code, Code::MissingBlobs);
+    assert!(
+        f.detail.starts_with("8 of 8 files not stored"),
+        "{}",
+        f.detail
+    );
+    assert_eq!(f.detail.matches("sha256:").count(), 5, "{}", f.detail);
+    assert!(f.detail.ends_with("and 3 more"), "{}", f.detail);
+}
+
+/// Waits until `dir` holds no file, or panics after a few seconds.
+async fn until_empty(dir: &Path) {
+    for _ in 0..200 {
+        if std::fs::read_dir(dir).unwrap().next().is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{} still holds a file", dir.display());
+}
+
+/// An upload whose stream is dropped mid-way, as when its connection goes
+/// and the stream's future with it, leaves no temporary file behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_upload_leaves_no_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let depot = Arc::new(Depot::open(dir.path(), Settings::default()).unwrap());
+    let size = 1u64 << 20;
+    let args = PutArgs {
+        digest: Digest::sha256(&vec![0; size as usize]),
+        size,
+    };
+    let opened = depot
+        .accept(methods::PUT, Value::serialized(&args).unwrap())
+        .unwrap()
+        .unwrap();
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (server_recv, server_send) = tokio::io::split(server);
+    let io = kuri_link::Duplex {
+        send: Box::new(server_send),
+        recv: Box::new(server_recv),
+    };
+    let task = tokio::spawn(opened.run(io));
+    let (_client_recv, mut client_send) = tokio::io::split(client);
+    client_send.write_all(&[0; 200_000]).await.unwrap();
+    let tmp = dir.path().join("tmp");
+    for _ in 0..200 {
+        if std::fs::read_dir(&tmp).unwrap().next().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        std::fs::read_dir(&tmp).unwrap().next().is_some(),
+        "the upload began"
+    );
+    task.abort();
+    let _ = task.await;
+    until_empty(&tmp).await;
+    // The client side was never closed: only dropping the future cleaned up.
+    drop(client_send);
+}
+
+/// The same over a real connection: the client goes away mid-upload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_lost_mid_upload_leaves_no_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let depot = Arc::new(Depot::open(dir.path(), Settings::default()).unwrap());
+    let key = NodeKey::generate();
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let server = Node::builder()
+        .relays(Relays::None)
+        .bind_addr(loopback)
+        .authorizer(Allowlist::new([key.public()]))
+        .serve(kuri_pub::APP, DepotService(depot))
+        .bind()
+        .await
+        .unwrap();
+    let client_node = Node::builder()
+        .secret_key(key)
+        .relays(Relays::None)
+        .bind_addr(loopback)
+        .bind()
+        .await
+        .unwrap();
+    let client = client_node
+        .connect(server.bound_addr(), kuri_pub::APP)
+        .await
+        .unwrap();
+    let size = 8u64 << 20;
+    let args = PutArgs {
+        digest: Digest::sha256(&vec![0; size as usize]),
+        size,
+    };
+    let mut io = client
+        .open(methods::PUT, Value::serialized(&args).unwrap())
+        .await
+        .unwrap();
+    io.send.write_all(&[0; 1 << 20]).await.unwrap();
+    let tmp = dir.path().join("tmp");
+    for _ in 0..200 {
+        if std::fs::read_dir(&tmp).unwrap().next().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    drop(io);
+    drop(client);
+    client_node.shutdown().await;
+    until_empty(&tmp).await;
+    drop(server);
 }
 
 /// What a crash leaves: the depot reopens on a log whose last record is torn,
