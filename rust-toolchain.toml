@@ -1,4 +1,6 @@
 [toolchain]
 channel = "1.97.0"
 components = ["rustfmt", "clippy"]
+# Clients run in a browser and on 32-bit ARM; CI checks the crate builds there.
+targets = ["wasm32-unknown-unknown", "armv7-unknown-linux-musleabihf"]
 profile = "minimal"

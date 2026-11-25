@@ -47,3 +47,11 @@ jobs:
 
       - name: Tests
         run: cargo test --offline --locked
+
+      # The contract crate is for every client: a browser's WebAssembly and
+      # 32-bit ARM included. Both targets come from rust-toolchain.toml.
+      - name: Check for wasm32-unknown-unknown
+        run: cargo check --workspace --offline --locked --target wasm32-unknown-unknown
+
+      - name: Check for armv7-unknown-linux-musleabihf
+        run: cargo check --workspace --offline --locked --target armv7-unknown-linux-musleabihf
