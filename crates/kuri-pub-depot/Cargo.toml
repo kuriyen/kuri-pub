@@ -1,0 +1,22 @@
+[package]
+name = "kuri-pub-depot"
+version = "0.0.0"
+description = "A kuri-pub depot: stores blobs and versions, and serves them as the Kuri Link app `pub`."
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+kuri-pub = { path = "../kuri-pub" }
+# The released Kuri Link, by its tag on the public repository.
+kuri-link = { git = "https://github.com/kuriyen/kuri-link", tag = "v0.3.3" }
+ciborium = "0.2.2"
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"

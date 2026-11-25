@@ -1,12 +1,19 @@
-"""Checks that every guard of the contract crate is tested.
+"""Checks that every guard is tested.
 
-Removes one guard at a time, runs the crate's tests, and expects some test to
-fail. A guard whose removal leaves every test green is untested. Run from the
-repository root: `python3 tools/guards.py [NAME...]`. When a guard is added,
-add its mutation here.
+Removes one guard at a time, runs the tests of the crate it is in, and expects
+some test to fail. A guard whose removal leaves every test green is untested.
+Run from the repository root: `python3 tools/guards.py [NAME...]`. When a guard
+is added, add its mutation here; the last field says which crate it is in.
+
+Not here, because no test can see them without crashing the machine: the
+depot's `fsync`s (of a blob before its rename, of the directory after it, of
+the log on each append, of the snapshot before it replaces the old one).
 """
 import subprocess, sys, pathlib
-S = pathlib.Path("crates/kuri-pub/src")
+CRATES = {
+    0: (pathlib.Path("crates/kuri-pub/src"), ["-p", "kuri-pub", "--lib"]),
+    1: (pathlib.Path("crates/kuri-pub-depot/src"), ["-p", "kuri-pub-depot"]),
+}
 M = [
  ("segment: empty", "names.rs", "    if s.is_empty() {\n        return Err(\"is empty\"", "    if false {\n        return Err(\"is empty\"", 0),
  ("segment: NFC", "names.rs", "if !is_nfc(s) {", "if false {", 0),
@@ -77,17 +84,42 @@ M = [
  ("methods: has cap", "methods.rs", "if self.digests.len() > MAX_HAS {", "if false {", 0),
  ("methods: version xor channel", "methods.rs", "(None, Some(c)) => Ok(At::Channel(c)),", "(_, Some(c)) => Ok(At::Channel(c)),", 0),
  ("fault: code shape", "fault.rs", "Some((code, detail)) if is_code(code) =>", "Some((code, detail)) =>", 0),
+ ("depot: list cursor cap", "depot.rs", "cursor(args.after.as_deref(), MAX_NAME)?;", "", 1),
+ ("depot: versions cursor cap", "depot.rs", "cursor(args.after.as_deref(), MAX_VERSION)?;", "", 1),
+ ("depot: versions cursor must name a version", "depot.rs", ".ok_or_else(|| not_found(format!(\"no version {after:?} to page after\")))?\n                    + 1", ".map_or(usize::MAX - 1, |i| i)\n                    + 1", 1),
+ ("depot: publish checks sizes", "depot.rs", "Some(size) if size == f.size => {}", "Some(_) => {}", 1),
+ ("depot: publish needs blobs", "depot.rs", "if !missing.is_empty() {", "if false {", 1),
+ ("depot: publish conflicts", "depot.rs", "return if stored.digest == digest {", "return if true {", 1),
+ ("depot: manifest stored before the index", "depot.rs", "            .put_bytes(&digest, manifest.bytes())\n", "            .size(&digest).map(|_| ())\n", 1),
+ ("depot: channel needs the version", "depot.rs", "if entry.version(args.version.as_str()).is_none() {", "if false {", 1),
+ ("depot: channel compare-and-set", "depot.rs", "&& expect != seq", "&& false", 1),
+ ("depot: get range", "depot.rs", "if offset > size {", "if false {", 1),
+ ("depot: put cap", "depot.rs", "if args.size > self.settings.max_blob {", "if false {", 1),
+ ("depot: put answers a stored blob at once", "depot.rs", "let result = match self.depot.store.size(&self.digest) {", "let result = match Ok::<Option<u64>, io::Error>(None) {", 1),
+ ("depot: put stops past the size", "depot.rs", "if got > self.size {", "if false {", 1),
+ ("depot: put size", "depot.rs", "if got != self.size {", "if false {", 1),
+ ("depot: put digest", "depot.rs", "if actual != self.digest {", "if false {", 1),
+ ("depot: put removes its temporary file", "depot.rs", "if outcome.is_err() {", "if false {", 1),
+ ("depot: arguments keep their fault code", "depot.rs", "kuri_pub::fault::CODES\n", "kuri_pub::fault::CODES[..0]\n", 1),
+ ("store: tmp emptied at start", "store.rs", "            fs::remove_dir_all(&tmp)?;\n", "", 1),
+ ("index: torn tail cut", "index.rs", "            log.set_len(good)?;\n", "", 1),
+ ("index: record length limit", "index.rs", "if len > MAX_RECORD {", "if false {", 1),
+ ("index: checksum", "index.rs", "if crc32fast::hash(&payload) != crc {", "if false {", 1),
+ ("index: publish applied once", "index.rs", "if entry.by_version.contains_key(version) {", "if false {", 1),
+ ("index: older channel record loses", "index.rs", "if *seq > current {", "if true {", 1),
+ ("index: compaction when long", "index.rs", "if self.in_log >= COMPACT_AFTER {", "if false {", 1),
 ]
 only = sys.argv[1:]
 bad = []
-for name, f, old, new, _ in M:
+for name, f, old, new, crate in M:
     if only and name not in only: continue
+    S, args = CRATES[crate]
     p = S / f; src = p.read_text()
     n = src.count(old)
     if n < 1: bad.append(f"{name}: pattern not found"); print("NOPATTERN", name); continue
     p.write_text(src.replace(old, new, 1))
     try:
-        r = subprocess.run(["cargo", "test", "-q", "-p", "kuri-pub", "--lib"], capture_output=True, text=True)
+        r = subprocess.run(["cargo", "test", "-q", *args], capture_output=True, text=True)
         out = r.stdout + r.stderr
         if r.returncode == 0: bad.append(f"{name}: SURVIVED"); print("SURVIVED", name)
         elif "error[" in out and "test result" not in out: bad.append(f"{name}: did not compile"); print("NOCOMPILE", name, out[out.find('error['):][:300])

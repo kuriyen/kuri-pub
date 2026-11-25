@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kuri-pub"]
+members = ["crates/kuri-pub", "crates/kuri-pub-depot"]
 
 [workspace.package]
 edition = "2024"
