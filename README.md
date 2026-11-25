@@ -7,7 +7,8 @@ with the patches made to them, and serves them to the home's devices over
 
 kuri-pub is part of [Kuriyen](https://github.com/kuriyen).
 
-> **Status:** nothing built yet.
+> **Status:** the contract is written ([docs/contract.md](docs/contract.md)) and
+> implemented by the crate `kuri-pub`; the depot that serves it is not built yet.
 
 Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
