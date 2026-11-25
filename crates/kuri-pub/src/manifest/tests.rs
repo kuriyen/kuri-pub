@@ -203,18 +203,21 @@ fn required_names_are_checked() {
 }
 
 #[test]
-fn files_must_be_a_non_empty_array() {
+fn files_must_be_an_array() {
     assert!(refused(with("files", None)).detail.contains("no files"));
     assert!(
         refused(with("files", Some(t("x"))))
             .detail
             .contains("no files")
     );
-    assert!(
-        refused(with("files", Some(Value::Array(vec![]))))
-            .detail
-            .contains("no files")
-    );
+}
+
+#[test]
+fn a_manifest_may_list_no_files() {
+    // A later list of versions is a manifest that names its members in
+    // `deps` and has no files of its own.
+    let m = Manifest::from_value(with("files", Some(Value::Array(vec![])))).unwrap();
+    assert!(m.files().is_empty());
 }
 
 #[test]

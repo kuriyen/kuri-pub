@@ -292,9 +292,6 @@ fn read_files(v: Option<&Value>) -> Result<Vec<File>, Fault> {
     let Some(Value::Array(items)) = v else {
         return Err(bad("manifest has no files array"));
     };
-    if items.is_empty() {
-        return Err(bad("manifest lists no files"));
-    }
     let files = items
         .iter()
         .map(|f| {

@@ -3,8 +3,13 @@
 //! A name, a version and every segment of a path may become a file or
 //! directory name on a front end's machine, Windows included. So they follow
 //! one rule, the segment rule, strict enough for every filesystem a front end
-//! is likely to write to. Loosening a rule later is an addition; tightening it
-//! would break manifests already published.
+//! is likely to write to.
+//!
+//! The depot enforces the rules on what it receives; a client checks them when
+//! it builds a request. Replies carry these values as plain text (see
+//! [`crate::methods`]), so loosening a rule later is an addition: an older
+//! client still reads a newer depot's replies, and skips what it cannot use.
+//! Tightening a rule would break manifests already published.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -28,11 +33,12 @@ pub const MAX_LABEL: usize = 64;
 const FORBIDDEN: [char; 9] = ['/', '\\', ':', '<', '>', '"', '|', '?', '*'];
 
 /// Names Windows keeps for devices, whatever the extension: `nul.txt` opens
-/// the null device. The superscript digits are reserved as well.
-const RESERVED: [&str; 28] = [
+/// the null device. The superscript digits are reserved as well, and so are
+/// the console's input and output.
+const RESERVED: [&str; 30] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-    "LPT9", "LPT¹", "LPT²", "LPT³",
+    "LPT9", "LPT¹", "LPT²", "LPT³", "CONIN$", "CONOUT$",
 ];
 
 /// Checks the segment rule; on failure, says why.
@@ -192,6 +198,13 @@ pub fn check_path(path: &str) -> Result<(), String> {
 /// Checks that a manifest's paths can all exist at once on a filesystem that
 /// ignores case: no two equal after lowercasing, and none a directory of
 /// another (`a` with `A/b`).
+///
+/// Lowercasing is Rust's `to_lowercase`, Unicode's full mapping: an
+/// approximation of how Windows compares names, not the same thing. NTFS
+/// upcases each character through its own table, so the two disagree on a few
+/// characters, in both directions: `ß` and `ẞ` are refused here but kept apart
+/// by NTFS, while `σ` and a word-final `ς` pass here but are one name on NTFS.
+/// Close enough for names people type; exact folding would need NTFS's table.
 pub fn check_paths_together<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
     let folded: Vec<(String, &str)> = paths.into_iter().map(|p| (p.to_lowercase(), p)).collect();
     let mut seen = HashSet::new();
@@ -279,6 +292,8 @@ mod tests {
             "lpt9.log",
             "COM¹",
             "con .txt",
+            "CONIN$",
+            "conout$.txt",
         ] {
             assert!(refused(s).contains("device"), "{s:?}");
         }

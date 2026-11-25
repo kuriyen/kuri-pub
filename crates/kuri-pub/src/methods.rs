@@ -1,8 +1,19 @@
 //! The methods of app `pub`: their names, arguments and results.
 //!
 //! Every type here is what travels in a Kuri Link call or stream, through
-//! serde. Kinds, names, versions, channels and digests check their rules as
-//! they are read, so a request that deserializes is one whose names are valid.
+//! serde.
+//!
+//! **Requests are checked, replies are read as written.** In an argument,
+//! kinds, names, versions, channels and digests check their rules as they are
+//! read, so a request that deserializes is one whose names are valid; the
+//! depot is where the rules are enforced. In a reply they are plain text (and
+//! a [`ReportedDigest`]), so that loosening a rule later is an addition: a
+//! depot that allows more still answers an older client, which reads the
+//! whole page and skips what it cannot act on. A client checks a value when it
+//! is about to use one, by building the request that uses it.
+//!
+//! Paging cursors (`after`) are text in a request as well: a cursor is the
+//! `next` a reply gave, and the depot only compares it bytewise.
 //!
 //! Read and write can be granted apart without touching this contract: Kuri
 //! Link asks its authorizer about each request with the method's name. A
@@ -13,7 +24,7 @@ use std::collections::BTreeMap;
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
 
-use crate::digest::Digest;
+use crate::digest::{Digest, ReportedDigest};
 use crate::fault::{Code, Fault};
 use crate::names::{Channel, Kind, Name, Version};
 
@@ -66,8 +77,8 @@ pub struct Empty {}
 /// One kind in the reply to `kinds`, which lists them in bytewise order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KindCount {
-    /// The kind.
-    pub kind: Kind,
+    /// The kind, as the depot reports it.
+    pub kind: String,
     /// How many names it has.
     pub names: u64,
 }
@@ -77,9 +88,9 @@ pub struct KindCount {
 pub struct ListArgs {
     /// Which kind.
     pub kind: Kind,
-    /// Start after this name; the previous page's `next`.
+    /// Start after this name; the previous page's `next`, as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<Name>,
+    pub after: Option<String>,
     /// Page size; see [`page_size`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -92,8 +103,8 @@ pub struct ListArgs {
 /// channel: that reply is stale, not a rollback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelPointer {
-    /// The version it points at.
-    pub version: Version,
+    /// The version it points at, as the depot reports it.
+    pub version: String,
     /// Its position.
     pub seq: u64,
 }
@@ -101,12 +112,12 @@ pub struct ChannelPointer {
 /// One name in a page of `list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItem {
-    /// The name.
-    pub name: Name,
+    /// The name, as the depot reports it.
+    pub name: String,
     /// How many versions it has.
     pub versions: u64,
-    /// Its channels.
-    pub channels: BTreeMap<Channel, ChannelPointer>,
+    /// Its channels, by name as the depot reports them.
+    pub channels: BTreeMap<String, ChannelPointer>,
 }
 
 /// A page of `list`, in bytewise order of the names.
@@ -116,7 +127,7 @@ pub struct ListPage {
     pub items: Vec<ListItem>,
     /// Pass as `after` for the next page; absent on the last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next: Option<Name>,
+    pub next: Option<String>,
 }
 
 /// Arguments of `versions`.
@@ -126,9 +137,9 @@ pub struct VersionsArgs {
     pub kind: Kind,
     /// Which name.
     pub name: Name,
-    /// Start after this version; the previous page's `next`.
+    /// Start after this version; the previous page's `next`, as given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<Version>,
+    pub after: Option<String>,
     /// Page size; see [`page_size`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -137,10 +148,10 @@ pub struct VersionsArgs {
 /// One version in a page of `versions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionItem {
-    /// The version.
-    pub version: Version,
+    /// The version, as the depot reports it.
+    pub version: String,
     /// Its manifest's digest.
-    pub manifest: Digest,
+    pub manifest: ReportedDigest,
     /// When the depot recorded it, in milliseconds since the Unix epoch.
     pub published: u64,
 }
@@ -152,7 +163,7 @@ pub struct VersionsPage {
     pub items: Vec<VersionItem>,
     /// Pass as `after` for the next page; absent on the last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next: Option<Version>,
+    pub next: Option<String>,
 }
 
 /// Arguments of `manifest`: a version, or a channel, not both.
@@ -196,11 +207,13 @@ impl ManifestArgs {
 /// The reply to `manifest`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestReply {
-    /// The version.
-    pub version: Version,
+    /// The version, as the depot reports it.
+    pub version: String,
     /// The manifest's digest.
-    pub digest: Digest,
-    /// The manifest, as stored.
+    pub digest: ReportedDigest,
+    /// The manifest, as stored. A client checks it with
+    /// [`crate::Manifest::from_value`] before acting on it; a manifest that
+    /// uses a rule this client does not know yet fails there, alone.
     pub manifest: Value,
     /// The channel's position, when asked by channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,7 +252,7 @@ pub struct PublishArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishReply {
     /// The manifest's digest.
-    pub digest: Digest,
+    pub digest: ReportedDigest,
     /// `false` when this exact manifest was already the version.
     pub created: bool,
 }
@@ -273,8 +286,9 @@ pub struct SetChannelArgs {
 /// The reply to `set_channel`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetChannelReply {
-    /// Where the channel pointed before, if it existed.
-    pub previous: Option<Version>,
+    /// Where the channel pointed before, if it existed, as the depot reports
+    /// it.
+    pub previous: Option<String>,
     /// Its new position.
     pub seq: u64,
 }
@@ -388,11 +402,13 @@ mod tests {
 
     #[test]
     fn arguments_with_a_bad_name_do_not_deserialize() {
+        let v = map(&[("kind", Value::Text("App".into()))]);
+        v.deserialized::<ListArgs>().unwrap_err();
         let v = map(&[
             ("kind", Value::Text("app".into())),
-            ("after", Value::Text("CON".into())),
+            ("name", Value::Text("CON".into())),
         ]);
-        v.deserialized::<ListArgs>().unwrap_err();
+        v.deserialized::<VersionsArgs>().unwrap_err();
     }
 
     #[test]
@@ -448,33 +464,165 @@ mod tests {
         round_trip(&args);
         args.expect = None;
         round_trip(&args);
-        round_trip(&SetChannelReply {
-            previous: None,
-            seq: 1,
-        });
-        round_trip(&SetChannelReply {
-            previous: Some(Version::new("1").unwrap()),
-            seq: 7,
-        });
+        // Replies are built from the wire here and below, as a client meets
+        // them, so the tests read the same whatever type a field has.
+        for reply in [
+            map(&[("previous", Value::Null), ("seq", Value::Integer(1.into()))]),
+            map(&[
+                ("previous", Value::Text("1".into())),
+                ("seq", Value::Integer(7.into())),
+            ]),
+        ] {
+            let r: SetChannelReply = reply.deserialized().unwrap();
+            assert_eq!(Value::serialized(&r).unwrap(), reply);
+        }
     }
 
     #[test]
     fn list_pages_carry_channel_positions() {
-        let page = ListPage {
-            items: vec![ListItem {
-                name: Name::new("x").unwrap(),
-                versions: 2,
-                channels: BTreeMap::from([(
-                    Channel::new("stable").unwrap(),
-                    ChannelPointer {
-                        version: Version::new("1").unwrap(),
-                        seq: 3,
-                    },
-                )]),
-            }],
-            next: None,
+        let wire = map(&[(
+            "items",
+            Value::Array(vec![map(&[
+                ("name", Value::Text("x".into())),
+                ("versions", Value::Integer(2.into())),
+                (
+                    "channels",
+                    map(&[(
+                        "stable",
+                        map(&[
+                            ("version", Value::Text("1".into())),
+                            ("seq", Value::Integer(3.into())),
+                        ]),
+                    )]),
+                ),
+            ])]),
+        )]);
+        let page: ListPage = wire.deserialized().unwrap();
+        assert_eq!(page.items[0].channels.values().next().unwrap().seq, 3);
+        assert_eq!(Value::serialized(&page).unwrap(), wire);
+    }
+
+    fn digest_wire(alg: &str, hex: &str) -> Value {
+        map(&[
+            ("alg", Value::Text(alg.into())),
+            ("hex", Value::Text(hex.into())),
+        ])
+    }
+
+    /// What a later depot may say: a kind with two dots, a name and a version
+    /// today's segment rule refuses, a channel with a dot, a digest under an
+    /// algorithm this contract does not define yet.
+    const LATER_KIND: &str = "mod.bg3.extra";
+    const LATER_NAME: &str = "CON";
+    const LATER_VERSION: &str = "1.0.";
+    const LATER_CHANNEL: &str = "beta.2";
+
+    #[test]
+    fn replies_read_what_a_later_depot_may_allow() {
+        for (what, s) in [
+            ("kind", Kind::new(LATER_KIND).err()),
+            ("name", Name::new(LATER_NAME).err()),
+            ("version", Version::new(LATER_VERSION).err()),
+            ("channel", Channel::new(LATER_CHANNEL).err()),
+        ] {
+            assert!(s.is_some(), "{what}: pick a value today's rule refuses");
+        }
+        let later_digest = digest_wire("merkle", &"0".repeat(64));
+        Digest::new("merkle", "0".repeat(64)).unwrap_err();
+
+        let kinds = Value::Array(vec![map(&[
+            ("kind", Value::Text(LATER_KIND.into())),
+            ("names", Value::Integer(1.into())),
+        ])]);
+        kinds.deserialized::<Vec<KindCount>>().expect("kinds");
+
+        let list = map(&[
+            (
+                "items",
+                Value::Array(vec![map(&[
+                    ("name", Value::Text(LATER_NAME.into())),
+                    ("versions", Value::Integer(1.into())),
+                    (
+                        "channels",
+                        map(&[(
+                            LATER_CHANNEL,
+                            map(&[
+                                ("version", Value::Text(LATER_VERSION.into())),
+                                ("seq", Value::Integer(1.into())),
+                            ]),
+                        )]),
+                    ),
+                ])]),
+            ),
+            ("next", Value::Text(LATER_NAME.into())),
+        ]);
+        let page: ListPage = list.deserialized().expect("list");
+        // The cursor a later depot gave goes back to it unchanged.
+        let next = map(&[
+            ("kind", Value::Text("app".into())),
+            (
+                "after",
+                Value::Text(page.next.as_ref().map(|n| n.to_string()).unwrap()),
+            ),
+        ]);
+        next.deserialized::<ListArgs>().expect("list cursor");
+
+        let versions = map(&[
+            (
+                "items",
+                Value::Array(vec![map(&[
+                    ("version", Value::Text(LATER_VERSION.into())),
+                    ("manifest", later_digest.clone()),
+                    ("published", Value::Integer(1.into())),
+                ])]),
+            ),
+            ("next", Value::Text(LATER_VERSION.into())),
+        ]);
+        let page: VersionsPage = versions.deserialized().expect("versions");
+        let reported: ReportedDigest = Value::serialized(&page.items[0].manifest)
+            .unwrap()
+            .deserialized()
+            .unwrap();
+        assert_eq!(reported.known().unwrap_err().code, Code::UnsupportedAlg);
+        let next = map(&[
+            ("kind", Value::Text("app".into())),
+            ("name", Value::Text("x".into())),
+            ("after", Value::Text(LATER_VERSION.into())),
+        ]);
+        next.deserialized::<VersionsArgs>()
+            .expect("versions cursor");
+
+        map(&[
+            ("version", Value::Text(LATER_VERSION.into())),
+            ("digest", later_digest.clone()),
+            ("manifest", map(&[])),
+            ("seq", Value::Integer(2.into())),
+        ])
+        .deserialized::<ManifestReply>()
+        .expect("manifest");
+
+        map(&[("digest", later_digest), ("created", Value::Bool(true))])
+            .deserialized::<PublishReply>()
+            .expect("publish");
+
+        map(&[
+            ("previous", Value::Text(LATER_VERSION.into())),
+            ("seq", Value::Integer(2.into())),
+        ])
+        .deserialized::<SetChannelReply>()
+        .expect("set_channel");
+    }
+
+    #[test]
+    fn a_reported_digest_is_checked_when_used() {
+        let d = Digest::sha256(b"x");
+        let reported = ReportedDigest::from(d.clone());
+        assert_eq!(reported.known().unwrap(), d);
+        let short = ReportedDigest {
+            alg: "sha256".into(),
+            hex: "00".into(),
         };
-        round_trip(&page);
+        assert_eq!(short.known().unwrap_err().code, Code::BadName);
     }
 
     #[test]

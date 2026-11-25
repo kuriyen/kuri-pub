@@ -131,6 +131,37 @@ impl From<Digest> for Wire {
     }
 }
 
+/// A digest as a depot reports it in a reply, read without checking.
+///
+/// A reply is read as the depot wrote it, so that a depot that has learnt a
+/// second algorithm still answers a client that has not: the client reads
+/// the whole page, and checks a digest with [`ReportedDigest::known`] only
+/// when it is about to use it. A request carries a [`Digest`], which the
+/// depot checks as it reads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReportedDigest {
+    /// The algorithm, as the depot named it.
+    pub alg: String,
+    /// The digest, as the depot wrote it.
+    pub hex: String,
+}
+
+impl ReportedDigest {
+    /// The digest, if this client knows its algorithm and the form is right.
+    pub fn known(&self) -> Result<Digest, Fault> {
+        Digest::new(&self.alg, self.hex.clone())
+    }
+}
+
+impl From<Digest> for ReportedDigest {
+    fn from(d: Digest) -> ReportedDigest {
+        ReportedDigest {
+            alg: d.alg.as_str().into(),
+            hex: d.hex,
+        }
+    }
+}
+
 /// `sha256:<hex>`, as a fault's detail names a digest.
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

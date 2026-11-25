@@ -7,6 +7,14 @@ the faults. The crate `kuri-pub` implements it; the server is `kuri-pub-depot`.
 Both tables (methods, manifest keys) only grow once released. A reader ignores
 what it does not know; a depot keeps it.
 
+**Requests are checked, replies are read as written.** The depot enforces the
+rules below on what it receives, and a client checks them when it builds a
+request. In a reply, kinds, names, versions and channels are plain text and a
+digest is read whatever its `alg`, so a client checks a value only when it is
+about to use it. That is what makes loosening a rule an addition: a depot that
+allows more still answers an older client, which reads the whole page and
+skips what it cannot act on. Tightening a rule would break what is published.
+
 ## 1. Values shared by both tables
 
 | Name | Encoding | Rule |
@@ -23,7 +31,7 @@ what it does not know; a depot keeps it.
 - no control character (`Cc`, which includes NUL);
 - none of `/ \ : < > " | ? *`;
 - does not end in `.` or a space (so not `.` or `..`);
-- not a Windows device name, in any case, compared on the part before the first `.`: `CON PRN AUX NUL COM1–9 LPT1–9 COM¹ COM² COM³ LPT¹ LPT² LPT³`.
+- not a Windows device name, in any case, compared on the part before the first `.`: `CON PRN AUX NUL COM1–9 LPT1–9 COM¹ COM² COM³ LPT¹ LPT² LPT³ CONIN$ CONOUT$`.
 
 Failures are `bad_name` for an argument and `bad_manifest` inside a manifest.
 
@@ -37,7 +45,7 @@ A CBOR map with text keys. A reader ignores keys it does not know. The depot **k
 | `kind` | text | yes | as §1 |
 | `name` | text | yes | as §1 |
 | `version` | text | yes | as §1 |
-| `files` | array of `{path: text, digest: Digest, size: uint}` | yes, at least 1 | `path`: relative, `/`-separated, each segment by the segment rule, ≤ 1024 bytes. Unique after lowercasing, and no path is a directory prefix of another after lowercasing (`a` with `A/b`). |
+| `files` | array of `{path: text, digest: Digest, size: uint}` | yes, may be empty | `path`: relative, `/`-separated, each segment by the segment rule, ≤ 1024 bytes. Unique after lowercasing, and no path is a directory prefix of another after lowercasing (`a` with `A/b`). Lowercasing is Unicode's full mapping, an approximation of NTFS's own upcase table that differs on a few characters (`ß`/`ẞ`, final `ς`). Empty is allowed for a manifest that only names others in `deps` (§5). |
 | `meta` | map text → text | no | Per-kind facts the depot does not interpret. Keys NFC. Open. |
 | `target` | `{os: text, arch: text}` | no | Rust's `std::env::consts::{OS, ARCH}` spellings. Absent means any. |
 | `deps` | array of `{kind, name, req: text}` | no | Recorded only; nothing resolves them yet. `req` is opaque. |
@@ -66,6 +74,8 @@ Every caller reaching the depot has been admitted by the home's gateway. The fir
 | `publish` | `{manifest}` | `{digest: Digest, created: bool}` | `bad_manifest`, `missing_blobs`, `conflict`, `too_large`, `unsupported_alg` |
 | `set_channel` | `{kind, name, channel, version, expect?: uint}` | `{previous: version or null, seq: uint}` | `bad_name`, `not_found` (version), `channel_moved` |
 
+- In the Returns column, `kind`, `name`, `version` and `channel` are text read as written, and a `Digest` is read whatever its `alg` (see the top of this document).
+- `after` is a cursor: the `next` of the previous page, passed back as given. The depot compares it bytewise and checks no rule on it.
 - `limit` defaults to 100 and is capped at 1000. Paging is by the last key seen, so a list does not shift under concurrent publishes.
 - `publish` checks that every file's blob is present **and** has the size the manifest claims. The same canonical digest as the stored version succeeds with `created: false`. A different one is `conflict`, whose detail names the stored digest (`conflict: stored sha256:<hex>`). A version is never deleted or replaced.
 - `missing_blobs` is a fallback. A client calls `has` first and uploads what is missing. The fault's detail is for people.
@@ -93,7 +103,7 @@ Kuri Link gives an application one fault, `App`, with a text message. kuri-pub's
 
 - **Signatures.** When they come, they sign index entries `(kind, name, version) → digest` and channel pointers with their `seq`, as TUF's targets metadata does. A manifest never carries its own signature, since its digest would have to cover itself.
 - **A second `alg`.** Reserved for Fuchsia's Merkle root: an SHA-256 tree over 8 KiB chunks. It lets `get` verify each chunk as it arrives, and lets the depot appear as a package repository to a Fuchsia resolver.
-- **Lists** (a set of versions to fetch together): later, as a manifest of kind `list` whose `deps` name its members. That needs no new method.
+- **Lists** (a set of versions to fetch together): later, as a manifest of kind `list` whose `deps` name its members and whose `files` is empty. That needs no new method and no change to the manifest.
 - **Delivering to a share, an inbox, patch origins**: not decided.
 - **Delete / garbage collection**: nothing is removed yet.
 
