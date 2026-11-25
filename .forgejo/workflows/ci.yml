@@ -48,10 +48,22 @@ jobs:
       - name: Tests
         run: cargo test --offline --locked
 
-      # The contract crate is for every client: a browser's WebAssembly and
-      # 32-bit ARM included. Both targets come from rust-toolchain.toml.
-      - name: Check for wasm32-unknown-unknown
-        run: cargo check --workspace --offline --locked --target wasm32-unknown-unknown
+      # The contract crate is for every client, a browser's WebAssembly
+      # included. The depot is a server and does not build there.
+      - name: Check the contract for wasm32-unknown-unknown
+        run: cargo check -p kuri-pub --offline --locked --target wasm32-unknown-unknown
 
+      # Both crates for 32-bit ARM, where a depot runs on a small NAS. The
+      # depot's TLS compiles C; ring's C needs no libc headers, so clang
+      # targeting the platform is enough, without a musl toolchain.
       - name: Check for armv7-unknown-linux-musleabihf
-        run: cargo check --workspace --offline --locked --target armv7-unknown-linux-musleabihf
+        run: |
+          if ! command -v clang >/dev/null 2>&1; then
+            SUDO=$(command -v sudo || true)
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq clang
+          fi
+          export CC_armv7_unknown_linux_musleabihf=clang
+          export CFLAGS_armv7_unknown_linux_musleabihf=--target=armv7-unknown-linux-musleabihf
+          export AR_armv7_unknown_linux_musleabihf=ar
+          cargo check --workspace --offline --locked --target armv7-unknown-linux-musleabihf
