@@ -11,8 +11,14 @@
 //! made it is answered, so an answer the client saw survives a crash.
 //!
 //! On start the index loads the snapshot, replays the log over it, and cuts
-//! off a torn last record: one whose frame is short or whose checksum fails,
-//! as a crash in the middle of an append leaves. Replaying a record twice
+//! off a torn last record: a bad frame (short, a failed checksum, a length no
+//! record can have) that reaches the end of the file, as a crash in the middle
+//! of an append leaves. A bad frame with more data after it is not a torn
+//! write but damage, and the records after it were answered: the index then
+//! refuses to open and names the offset, for a person to look at. An append
+//! that fails is cut back off the log before the error is returned, so the
+//! next record never lands behind it; if it cannot be cut back, the index
+//! refuses every later write until the depot restarts. Replaying a record twice
 //! changes nothing, so a crash between writing a snapshot and emptying the log
 //! loses nothing either. The state lives in memory: it holds names and
 //! digests, not content.
@@ -119,8 +125,26 @@ pub type Kinds = BTreeMap<String, BTreeMap<String, Entry>>;
 pub struct Index {
     dir: PathBuf,
     log: File,
+    /// The log's length after its last whole record.
+    len: u64,
     in_log: usize,
     kinds: Kinds,
+    /// Why writes are refused, once an append could not be cut back.
+    broken: Option<String>,
+    #[cfg(test)]
+    fail: Fail,
+}
+
+/// Failures a test injects into the log's I/O.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Fail {
+    /// The write stops halfway.
+    write: bool,
+    /// The write lands, the sync fails.
+    sync: bool,
+    /// Cutting the log back fails.
+    cut: bool,
 }
 
 impl Index {
@@ -147,8 +171,9 @@ impl Index {
             .append(true)
             .create(true)
             .open(&log_path)?;
-        let (records, good) = read_log(&mut log)?;
-        if good < log.metadata()?.len() {
+        let file_len = log.metadata()?.len();
+        let (records, good) = read_log(&mut log, file_len)?;
+        if good < file_len {
             // A torn last record: the append it belonged to was never
             // answered, so dropping it loses nothing a client was told.
             log.set_len(good)?;
@@ -161,8 +186,12 @@ impl Index {
         let mut index = Index {
             dir: dir.to_owned(),
             log,
+            len: good,
             in_log: records.len(),
             kinds,
+            broken: None,
+            #[cfg(test)]
+            fail: Fail::default(),
         };
         if index.in_log > 0 {
             index.compact()?;
@@ -181,7 +210,16 @@ impl Index {
     }
 
     /// Records `record`: appends it to the log, syncs it, then applies it.
+    ///
+    /// On failure nothing is applied, and the log is cut back to where it
+    /// was, so the next append does not land behind a partial or unsynced
+    /// frame. If that fails too, this and every later append is refused.
     pub fn append(&mut self, record: Record) -> io::Result<()> {
+        if let Some(why) = &self.broken {
+            return Err(io::Error::other(format!(
+                "the index refuses writes until the depot restarts: {why}"
+            )));
+        }
         let mut payload = Vec::new();
         ciborium::into_writer(&record, &mut payload)
             .map_err(|e| io::Error::other(format!("encoding a record: {e}")))?;
@@ -189,14 +227,45 @@ impl Index {
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
         frame.extend_from_slice(&payload);
-        self.log.write_all(&frame)?;
-        self.log.sync_data()?;
+        if let Err(e) = self.write_frame(&frame) {
+            if let Err(cut) = self.cut_back() {
+                self.broken = Some(format!(
+                    "an append failed ({e}) and could not be cut back off the log ({cut})"
+                ));
+            }
+            return Err(e);
+        }
+        self.len += frame.len() as u64;
         apply(&mut self.kinds, &record);
         self.in_log += 1;
         if self.in_log >= COMPACT_AFTER {
             self.compact()?;
         }
         Ok(())
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail.write {
+            self.log.write_all(&frame[..frame.len() / 2])?;
+            return Err(io::Error::other("injected: the write stopped halfway"));
+        }
+        self.log.write_all(frame)?;
+        #[cfg(test)]
+        if self.fail.sync {
+            return Err(io::Error::other("injected: the sync failed"));
+        }
+        self.log.sync_data()
+    }
+
+    /// Cuts the log back to its last whole record.
+    fn cut_back(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail.cut {
+            return Err(io::Error::other("injected: the cut failed"));
+        }
+        self.log.set_len(self.len)?;
+        self.log.sync_all()
     }
 
     /// Writes the state as the snapshot and empties the log.
@@ -236,6 +305,7 @@ impl Index {
         // line replays it over the snapshot, which changes nothing.
         self.log.set_len(0)?;
         self.log.sync_all()?;
+        self.len = 0;
         self.in_log = 0;
         Ok(())
     }
@@ -295,8 +365,9 @@ fn apply(kinds: &mut Kinds, record: &Record) {
 }
 
 /// Reads the log's records, and the length of the part that holds whole,
-/// intact ones.
-fn read_log(log: &mut File) -> io::Result<(Vec<Record>, u64)> {
+/// intact ones. A bad frame that reaches the end of the file is a torn write
+/// and ends the log there; one with data after it is damage, and an error.
+fn read_log(log: &mut File, file_len: u64) -> io::Result<(Vec<Record>, u64)> {
     log.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(&*log);
     let mut records = Vec::new();
@@ -308,21 +379,38 @@ fn read_log(log: &mut File) -> io::Result<(Vec<Record>, u64)> {
         }
         let len = u32::from_le_bytes(head[..4].try_into().unwrap());
         let crc = u32::from_le_bytes(head[4..].try_into().unwrap());
-        if len > MAX_RECORD {
-            break;
-        }
-        let mut payload = vec![0u8; len as usize];
-        if !read_full(&mut reader, &mut payload)? {
-            break;
-        }
-        if crc32fast::hash(&payload) != crc {
-            break;
-        }
-        let Ok(record) = ciborium::from_reader::<Record, _>(payload.as_slice()) else {
-            break;
+        let end = good + 8 + u64::from(len);
+        let whole = len <= MAX_RECORD && end <= file_len;
+        let record = if whole {
+            let mut payload = vec![0u8; len as usize];
+            if !read_full(&mut reader, &mut payload)? {
+                break;
+            }
+            (crc32fast::hash(&payload) == crc)
+                .then(|| ciborium::from_reader::<Record, _>(payload.as_slice()).ok())
+                .flatten()
+        } else {
+            None
         };
-        records.push(record);
-        good += 8 + u64::from(len);
+        match record {
+            Some(record) => {
+                records.push(record);
+                good = end;
+            }
+            // Torn: the bad frame runs to the end of the file, or past it.
+            None if end >= file_len => break,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the index log is damaged at byte {good} of {file_len}: a bad record \
+                         with whole records after it, so not a torn write; those records \
+                         were answered and are not dropped. Move the log aside to start \
+                         without them."
+                    ),
+                ));
+            }
+        }
     }
     Ok((records, good))
 }
@@ -423,6 +511,84 @@ mod tests {
         fs::write(&log, &bytes).unwrap();
         let index = Index::open(dir.path()).unwrap();
         assert_eq!(index.entry("app", "x").unwrap().versions.len(), 1);
+    }
+
+    #[test]
+    fn damage_before_whole_records_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.append(publish("x", "1")).unwrap();
+        index.append(publish("x", "2")).unwrap();
+        drop(index);
+        let log = dir.path().join("log");
+        let mut bytes = fs::read(&log).unwrap();
+        bytes[8] ^= 0x01;
+        fs::write(&log, &bytes).unwrap();
+        let e = Index::open(dir.path()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("at byte 0 of"), "{e}");
+        // Nothing was cut.
+        assert_eq!(fs::read(&log).unwrap(), bytes);
+    }
+
+    fn versions(index: &Index) -> Vec<String> {
+        index
+            .entry("app", "x")
+            .unwrap()
+            .versions
+            .iter()
+            .map(|v| v.version.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_write_that_stops_halfway_is_cut_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.append(publish("x", "1")).unwrap();
+        index.fail.write = true;
+        index.append(publish("x", "2")).unwrap_err();
+        index.fail.write = false;
+        assert_eq!(versions(&index), ["1"]);
+        index.append(publish("x", "3")).unwrap();
+        drop(index);
+        assert_eq!(versions(&Index::open(dir.path()).unwrap()), ["1", "3"]);
+    }
+
+    #[test]
+    fn a_failed_sync_is_cut_back() {
+        // The failed move and the next one carry the same position; only the
+        // one the client was told succeeded may survive a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.append(publish("x", "1")).unwrap();
+        index.append(channel("1", 1)).unwrap();
+        index.fail.sync = true;
+        index.append(channel("2", 2)).unwrap_err();
+        index.fail.sync = false;
+        assert_eq!(index.entry("app", "x").unwrap().channels["stable"].seq, 1);
+        index.append(channel("3", 2)).unwrap();
+        drop(index);
+        let index = Index::open(dir.path()).unwrap();
+        let c = &index.entry("app", "x").unwrap().channels["stable"];
+        assert_eq!((c.version.as_str(), c.seq), ("3", 2));
+    }
+
+    #[test]
+    fn an_append_that_cannot_be_cut_back_stops_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.append(publish("x", "1")).unwrap();
+        index.fail.write = true;
+        index.fail.cut = true;
+        index.append(publish("x", "2")).unwrap_err();
+        index.fail = Fail::default();
+        let e = index.append(publish("x", "3")).unwrap_err();
+        assert!(e.to_string().contains("refuses writes"), "{e}");
+        // What was answered before is still there after a restart, which cuts
+        // the partial frame off as a torn tail.
+        drop(index);
+        assert_eq!(versions(&Index::open(dir.path()).unwrap()), ["1"]);
     }
 
     #[test]
