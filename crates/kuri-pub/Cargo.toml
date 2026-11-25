@@ -1,8 +1,15 @@
 [package]
 name = "kuri-pub"
 version = "0.0.0"
+description = "The contract of a kuri-pub depot: names, manifests, digests, methods and faults."
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[dependencies]
+ciborium = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+unicode-normalization = "0.1"
