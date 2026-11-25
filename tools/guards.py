@@ -8,6 +8,7 @@ is added, add its mutation here; the last field says which crate it is in.
 Not here, because no test can see them without crashing the machine: the
 depot's `fsync`s (of a blob before its rename, of the directory after it, of
 the log on each append, of the snapshot before it replaces the old one).
+Failed appends are injected in the index's own unit tests.
 """
 import subprocess, sys, pathlib
 CRATES = {
@@ -99,15 +100,22 @@ M = [
  ("depot: put stops past the size", "depot.rs", "if got > self.size {", "if false {", 1),
  ("depot: put size", "depot.rs", "if got != self.size {", "if false {", 1),
  ("depot: put digest", "depot.rs", "if actual != self.digest {", "if false {", 1),
- ("depot: put removes its temporary file", "depot.rs", "if outcome.is_err() {", "if false {", 1),
  ("depot: arguments keep their fault code", "depot.rs", "kuri_pub::fault::CODES\n", "kuri_pub::fault::CODES[..0]\n", 1),
  ("store: tmp emptied at start", "store.rs", "            fs::remove_dir_all(&tmp)?;\n", "", 1),
  ("index: torn tail cut", "index.rs", "            log.set_len(good)?;\n", "", 1),
- ("index: record length limit", "index.rs", "if len > MAX_RECORD {", "if false {", 1),
- ("index: checksum", "index.rs", "if crc32fast::hash(&payload) != crc {", "if false {", 1),
+ ("index: record length limit", "index.rs", "let whole = len <= MAX_RECORD && end <= file_len;", "let whole = end <= file_len;", 1),
+ ("index: checksum", "index.rs", "(crc32fast::hash(&payload) == crc)", "(true)", 1),
  ("index: publish applied once", "index.rs", "if entry.by_version.contains_key(version) {", "if false {", 1),
  ("index: older channel record loses", "index.rs", "if *seq > current {", "if true {", 1),
  ("index: compaction when long", "index.rs", "if self.in_log >= COMPACT_AFTER {", "if false {", 1),
+ ("depot: upload's temporary file guarded", "depot.rs", "            let _ = std::fs::remove_file(path);\n", "            let _ = path;\n", 1),
+ ("depot: earliest code in a fault's text", "depot.rs", "            .min()\n", "            .max()\n", 1),
+ ("depot: missing blobs detail bounded", "depot.rs", "let shown = missing.len().min(MISSING_SHOWN);", "let shown = missing.len();", 1),
+ ("store: exclusive lock", "store.rs", "match lock.try_lock() {", "match Ok::<(), fs::TryLockError>(()) {", 1),
+ ("store: blobs read-only", "store.rs", "        file.set_permissions(read_only)?;\n", "", 1),
+ ("index: failed append cut back", "index.rs", "if let Err(cut) = self.cut_back() {", "if let Err(cut) = Ok::<(), io::Error>(()) {", 1),
+ ("index: writes stop when not cut back", "index.rs", "if let Some(why) = &self.broken {", "if let Some(why) = None::<&String> {", 1),
+ ("index: damage before whole records refused", "index.rs", "None if end >= file_len => break,", "None => break,", 1),
 ]
 only = sys.argv[1:]
 bad = []

@@ -4,9 +4,9 @@
 //! ```text
 //! kuri-pub-depot --store DIR [--max-blob BYTES]
 //!                [--port PORT | --bind ADDR] [--port-mapping]
-//!                [--peers FILE] [--key FILE] [--relay URL]...
+//!                [--peers FILE] [--key FILE] [--relay URL]... [--local-discovery]
 //! kuri-pub-depot --store DIR [--max-blob BYTES]
-//!                --gateway FILE [--gateway-ticket TICKET] [--key FILE]
+//!                --gateway FILE [--gateway-ticket TICKET] [--key FILE] [--local-discovery]
 //! ```
 //!
 //! `--store DIR` holds the blobs and the index; it is created if it is new.
@@ -18,6 +18,11 @@
 //! `--port-mapping` asks the router to forward the port, `--peers` keeps the
 //! paired devices across restarts and `--key` the depot's own key, `--relay`
 //! names a relay to stay reachable through.
+//!
+//! `--local-discovery` announces the depot on the local network by mDNS, so
+//! devices there find it whatever its address has become. It is off unless
+//! given: the announcement tells everyone on the network the depot's key and
+//! addresses, and only its owner should decide that.
 //!
 //! With `--gateway`, it listens for nothing and serves through a home's
 //! gateway, which pairs the devices. FILE holds the gateway's address; the
@@ -61,6 +66,7 @@ async fn run() -> Result<(), String> {
     let mut gateway: Option<PathBuf> = None;
     let mut gateway_ticket: Option<Ticket> = None;
     let mut relays: Vec<RelayUrl> = Vec::new();
+    let mut local_discovery = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
@@ -72,6 +78,7 @@ async fn run() -> Result<(), String> {
             "--bind" => bind = Some(value()?.parse().map_err(|e| format!("--bind: {e}"))?),
             "--port" => port = Some(value()?.parse().map_err(|e| format!("--port: {e}"))?),
             "--port-mapping" => port_mapping = true,
+            "--local-discovery" => local_discovery = true,
             "--peers" => {
                 peers = Some(PeerSet::open(value()?).map_err(|e| format!("--peers: {e}"))?)
             }
@@ -104,7 +111,7 @@ async fn run() -> Result<(), String> {
         } else {
             Relays::Custom(relays.clone())
         })
-        .local_discovery(true)
+        .local_discovery(local_discovery)
         .serve(kuri_pub::APP, DepotService(Arc::new(depot)));
     if let Some(key) = key {
         builder = builder.secret_key(key);
