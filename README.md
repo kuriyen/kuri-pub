@@ -8,7 +8,27 @@ with the patches made to them, and serves them to the home's devices over
 kuri-pub is part of [Kuriyen](https://github.com/kuriyen).
 
 > **Status:** the contract is written ([docs/contract.md](docs/contract.md)) and
-> implemented by the crate `kuri-pub`; the depot that serves it is not built yet.
+> implemented by the crate `kuri-pub`. The depot that serves it is the crate
+> `kuri-pub-depot`, a library and a binary. No front end yet.
+
+## Running a depot
+
+```text
+kuri-pub-depot --store DIR [--max-blob BYTES]
+               [--port PORT | --bind ADDR] [--port-mapping]
+               [--peers FILE] [--key FILE] [--relay URL]...
+kuri-pub-depot --store DIR --gateway FILE [--gateway-ticket TICKET] [--key FILE]
+```
+
+`DIR` holds the blobs and the index, and is created if it is new. Listening,
+the depot prints a one-line pairing ticket for one device; behind a home's
+Kuri Link gateway, the gateway pairs the devices instead. Keep `--key` (and
+`--peers` when listening) so the depot is the same node after a restart.
+
+Its memory does not grow with what it stores or serves: uploads stream through
+a fixed buffer into a temporary file in the store, downloads are read a fixed
+chunk at a time, and the index in memory holds names and digests only. It runs
+on 32-bit ARM.
 
 Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
